@@ -1,2 +1,4 @@
 data/
-lab_fetcher/__pycache__
+training_data/
+frp_data/
+archive/

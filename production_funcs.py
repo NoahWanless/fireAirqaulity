@@ -3,7 +3,9 @@ import matplotlib.pyplot as plt
 import warnings
 import numpy as np
 import pandas as pd
+import xesmf as xe
 import warnings
+import math
 from pyproj import CRS, Transformer#these are the transformers for projections 
 crs_aea_epsg = CRS.from_epsg(5070) #albers eaqual area projection
 transformer = Transformer.from_crs("EPSG:4326", crs_aea_epsg, always_xy=True) 
@@ -11,48 +13,19 @@ import os
 
 
 
-#plots the data, assumes that there are the 7 variables passed in, bc it only displays those first 6
-# data_x: the model input data
-# data_y: the model target data
-def plotPMvsData(data_x,data_y):
-    fig, axs = plt.subplots(2, 3, figsize=(17, 8))
-
-    axs[0,0].scatter(data_x[:,1],data_y,s=.7)
-    axs[0,0].set_xlabel("Variable 1: col_frp")
-    axs[0,0].set_ylabel("PM2.5")
-
-    axs[0,1].scatter(data_x[:,2],data_y,s=.7)
-    axs[0,1].set_xlabel("Variable 1: u10")
-    axs[0,1].set_ylabel("PM2.5")
-
-    axs[0,2].scatter(data_x[:,3],data_y,s=.7)
-    axs[0,2].set_xlabel("Variable 2: v10")
-    axs[0,2].set_ylabel("PM2.5")
-
-    axs[1,0].scatter(data_x[:,4],data_y,s=.7)
-    axs[1,0].set_xlabel("Variable 3: t2m")
-    axs[1,0].set_ylabel("PM2.5")
-
-    axs[1,1].scatter(data_x[:,5],data_y,s=.7)
-    axs[1,1].set_xlabel("Variable 4: sp")
-    axs[1,1].set_ylabel("PM2.5")
-
-    axs[1,2].scatter(data_x[:,6],data_y,s=.7)
-    axs[1,2].set_xlabel("Variable 5: d2m")
-    axs[1,2].set_ylabel("PM2.5")
-    plt.show()
-
-    fig = plt.figure(figsize=(8, 6))
-    ax = fig.add_subplot(111, projection='3d')
-    img = ax.scatter(data_x[:,2], data_x[:,3], data_y, c=data_y, cmap='viridis', marker='o')
-    ax.set_xlabel('Wind component u10')
-    ax.set_ylabel('Wind component v10')
-    ax.set_zlabel('PM2.5')
-    ax.set_title('PM2.5 vs Wind')
-    plt.show()
-
-
-
+def merge_in_era5(hrrrDS,era5DS):
+    era5DS = era5DS.reset_coords("number",drop=True).reset_coords("expver",drop=True).rename({"valid_time":"time"})
+    
+    
+    regridder = xe.Regridder(
+        era5DS,
+        hrrrDS,
+        "bilinear"
+    )
+    era5DS_on_hrrr = regridder(era5DS)
+    hrrrDS = hrrrDS.merge(era5DS_on_hrrr)
+    
+    return hrrrDS
 
 
 
@@ -100,6 +73,36 @@ def training_date_ranges(start_date='2025-01-07 20:00',end_date='2025-01-07 20:0
     dates_str_train =dates_str_train.str.cat([".000000000"]*len(dates_str_train))
     return date_r_compare,dates_str_compare,date_r_train,dates_str_train
 
+############ reach_back ############
+# date: The current date we are considering
+# dates: The list of all dates at our disposal
+# reach_back: How many hours back we want (but may not be able) to reach to get
+############ Returns: ############
+# a list of the dates we got (including the one we passed in)
+def reach_back(date,dates,reach_back=0):
+    if isinstance(dates, pd.Index) != True:
+        raise ValueError("Dates list must be a pandas index object")
+    if reach_back == 0:
+        return date
+    else:
+        index = dates.get_loc(date)
+        starting_index = 0 if reach_back > index else index - reach_back
+        return dates[starting_index:index+1]
+
+#this is a sin function with y intercept 1 and a period manipluated such that the first time it crosses the x axies is slightly after the time_factor.
+# this makes it so time values closer to the current time have more weight
+#! IN FUTURE MAKE THIS A LOG FUNCTION, exponetial decreasing no sin
+def frp_time_scale(time_factor,reach_back):
+    return -math.sin(.25*(2*math.pi*time_factor)/(reach_back+.5) - math.pi/2)
+
+#works under the assumtion that the first element is the most recent
+#this could be expanded to be a better function
+def aggragate_frp_temporal(frps):
+    total = 0
+    for index, frp in enumerate(frps):
+        total = total + frp * frp_time_scale(index,len(frps))
+    return total
+
 
 ############ get_collective_frp ############
 # x_coord,y_coord: the projected x,y coordinate of the station
@@ -110,7 +113,7 @@ def training_date_ranges(start_date='2025-01-07 20:00',end_date='2025-01-07 20:0
 ############ Returns: ############
 # the collective frp for the sation within the range
 def get_collective_frp(x_relavent,y_relavent,x_coord,y_coord,clean_u10,clean_v10,clean_frp,safe=True):
-    fire_wind = np.array([clean_u10,clean_v10]).T #TODO: CHECK IF THIS IS THE CORRECT ORDER
+    fire_wind = np.array([clean_u10,clean_v10]).T 
     fires_xy = np.array([x_relavent,y_relavent]) #array of fire positions (row 0 is the x coords, row 1 is the y coords)
     station_temp = np.tile([x_coord,y_coord], (fires_xy.shape[1], 1)).T
     
@@ -148,41 +151,3 @@ def get_collective_frp(x_relavent,y_relavent,x_coord,y_coord,clean_u10,clean_v10
     frps = np.divide(step2,step3)
     collective_frp_value = frps.sum()
     return collective_frp_value
-
-
-########### get_close_data ###########
-# sta: the station itself we are using
-# weather_frp_region: the weather and frp, we use this to get the cell closest to the station
-# mask_lon: the lon values of the fire cells (these are still xarray datasets form )
-# mask_lat: the lon values of the fire cells
-# masked: the masked weather and frp data to being only fires
-# dist_away: how far away fires can be to be considered
-########### Returns: ###########
-# fires_near: the dataset that was masked to be just the fires in range
-# mask_x, mask_y: the transformed x,y coords of the fires
-# dist_mask: the mask of fires that are within
-# x_coord, y_coord: the x,y coords (projected) of the station
-# station_weather_near: the weather cell nearest the station
-def get_close_data(sta,weather_frp_region,mask_lon,mask_lat,masked,dist_away=10000000):
-    ###### find the closest weather cell of the station
-    ##### This uses base euclidean distance but because the distances will be rather small itll be fine i think #####
-    #####TODO: change this to use the porjected coords you calcuated eariler :TODO#####
-    #####TODO: change this to use the porjected coords you calcuated eariler :TODO#####
-    dist = (weather_frp_region.lat - sta.lat.values)**2 + (weather_frp_region.lon - sta.long.values)**2
-    min_idx = dist.argmin(dim=["y", "x"]) # Find the (y, x) index of the minimum distance 
-    #this gets the weather info for the cell closest to the station
-    station_weather_near = weather_frp_region.isel(y=min_idx["y"].values, x=min_idx["x"].values)
-    
-    ########## now we will find all the fires within the region of the station ##########
-    ########## this uses the alber equal area projection formula ##########
-    x_coord, y_coord = transformer.transform(sta.long.values, sta.lat.values) #this is the station lat longs now transformed into 2d coords 
-    mask_x,mask_y = transformer.transform(mask_lon, mask_lat)
-    x_diff = mask_x - x_coord #gets the difference between each point 
-    y_diff = mask_y - y_coord
-    diff = np.array([x_diff,y_diff])
-    dist = np.linalg.norm(diff,axis=0) #now calcuates the distance between each point (now of shape 14x43 or the orginal shape of mask_lon and etc)
-    dist_mask = dist < dist_away #makes a mask of all points that are within the needed distance dist_away
-    dist_mask_np = xr.DataArray(dist_mask,dims=["y", "x"]) #makes the mask a xarray
-    fires_near = masked.where(dist_mask_np) 
-    
-    return fires_near, mask_x,mask_y,dist_mask,x_coord, y_coord,station_weather_near

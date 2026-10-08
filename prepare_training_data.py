@@ -6,26 +6,23 @@ import math
 import zarr
 import logging
 import sys
-from production_funcs import training_date_ranges,uniquify
+from production_funcs import training_date_ranges,uniquify,merge_in_era5
 from pyproj import CRS, Transformer
+from scipy.spatial import KDTree
 
 sys.dont_write_bytecode = True
 crs_aea_epsg = CRS.from_epsg(5070) #albers eaqual area projection
 transformer = Transformer.from_crs("EPSG:4326", crs_aea_epsg, always_xy=True) 
-
 #makes sure the file name we save to in the end is unqiue
 X_train_path = uniquify('training_data/X_train.csv')
 y_train_path = uniquify('training_data/y_train.csv')
 logging_path = uniquify("training_data/training_data.log")
 logging.basicConfig(filename=logging_path, level=logging.INFO)
-
 # Example inputs for this program:
 '''
-python prepare_training_data.py --zarrPath "/media/volume/firebackup/med_test/20250801_0000-20250831_2300_WF.zarr" --statPath "/home/exouser/code/labfetch/station_with_frp_2.csv" --start '2025-08-01 02:00' --end '2025-08-31 21:00' --offset 1
-python prepare_training_data.py --zarrPath "/media/volume/firebackup/med_test/20250801_0000-20250831_2300_WF.zarr" --statPath "/home/exouser/code/labfetch/station_with_frp_2.csv" --start '2025-08-01 02:00' --end '2025-08-31 21:00' --offset 1
+python prepare_training_data.py --zarrPath "/home/exouser/labfetch/data/cali1mounthaug25.zarr" --statPath "/home/exouser/fireAirqaulity/station_with_frp.csv" --start '2025-08-03 02:00' --end '2025-08-20 21:00' --offset 1
 '''
-# start_date: str = '2025-01-07 20:00',
-# end_date: str = '2025-01-07 20:00'
+
 def main():
     # gets all the arguements we need
     parser = argparse.ArgumentParser()
@@ -46,147 +43,167 @@ def main():
     logging.info(f"Start time: {start_time}")
     logging.info(f"End time: {end_time}")
     logging.info(f"Offset between between when we are predicting and what info we have: {offset}")
-
+    weather_variables = [
+        'u10',
+        'v10',
+        'tp',
+        't2m',
+        'sp',
+        'd2m'
+    ]
     ############### load in the station data ###############
-    df = pd.read_csv(statPath) 
-    station = df.to_xarray()
-    date_hour = station['Date Local'] + ' ' + station['Time Local']
-    new_id = station['County Code'].astype(str) + ' ' + station['Site Num'].astype(str) + ' ' + station['State Code'].astype(str) + ' ' + station['POC'].astype(str)
-    station = station.assign_coords({'lat':station['Latitude'],'long':station['Longitude'],'date_hour':date_hour,'new_id':new_id})
-
+    station_ds = pd.read_csv(statPath) 
+    date_hour = station_ds['Date Local'] + ' ' + station_ds['Time Local']
+    aqis_id = station_ds['State Code'].astype('str') + ' ' + station_ds['County Code'].astype('str') + ' ' + station_ds['Site Num'].astype('str') + ' ' + station_ds['POC'].astype('str')
+    station_ds['aqis_id'] = aqis_id
+    station_ds['date_hour'] = date_hour 
+    station_ds = station_ds.set_index('date_hour')
     ############### load in the zarr data ###############
     store = zarr.open_group(zarrPath, mode='r')
     available_fires = list(store.group_keys())
-
     if not available_fires:
         print("No fires found in the Zarr store!")
         exit
     else:
         print(f"Fires available on disk: {available_fires}")
         logging.info(f"Fires available on disk: {available_fires}")
-        #fire_id = available_fires[3]    
-
-    ## If we only want one fire group then we set it accordingly ##
-    if fire_group != None:
-        available_fires = available_fires[fire_group]
-
-    Y_temp = []
-    X_temp = []
-    
-    for fire_id in available_fires: #for each fire group 
         # MUST use consolidated=False to read the appended stream correctly!
-        ds = xr.open_zarr(zarrPath, group=fire_id , consolidated=False)  # group=fire_id 
-        fire_name = ds.attrs.get('Fire_Name', '')
-        ds.load()
+        ds = xr.open_zarr(zarrPath, group=available_fires[0], consolidated=False)
+        era5DS = xr.open_dataset(
+            "/home/exouser/fireAirqaulity/era5_hourly_precipitation_aug.nc",
+            engine="netcdf4" #netcdf4, cfgrib
+        )
+        #For some reason the total percipatation in aug is really small
+        ds = merge_in_era5(ds,era5DS)
 
-        ############### prepare dates for gathering the data ###############
-        date_r_compare,dates_str_compare,date_r_train,dates_str_train = training_date_ranges(start_date=start_time,end_date=end_time,hour_offset=offset)
-
-        ############### get only stations with frp values to use for training ###############
-        station_only_frps = station.dropna(dim="index", subset=['collective_frps'])
-        skip_nans = True #this means as we iterate through all the values, we skip ones that nan, or have no collective frp value
-
-        data_len = station_only_frps.collective_frps.values.shape[0]
+        ds.load() 
         
-        
-        ############### Main loop ###############
-        for r_compare,str_compare,r_train,str_train in zip(date_r_compare,dates_str_compare,date_r_train,dates_str_train): #for each timestamp
-            try:
-                stations_current = station_only_frps.sel(indexers={'date_hour':r_train}) #gets the current station info
-                stations_future = station.sel(indexers={'date_hour':r_compare}) #gets the future station info
-            except KeyError:
-                continue
+    final_data = []
 
-            weather_current = ds.sel(indexers={'time':str_train},method='nearest') #gets the current weather info
-            
-            if stations_current['new_id'].ndim > 0: #if the time series in question has more then one entry
-                iterator = enumerate(stations_current['new_id'])    
-                for i,stat in iterator: #for each station by index of the current timestep
-                    site_id = stat.values
-                    try:
-                        stat_current = stations_current.sel(indexers={'new_id':site_id}) #get that specifc station by its index (current)
-                        stat_future = stations_future.sel(indexers={'new_id':site_id}) #(future)
-                    except KeyError:
-                        print("There was some sort of error when loading in these sites, skipping to the next one")
-                        continue
-                    col_frp = stat_current.collective_frps.values.flatten().item() #collective frp
-                    if math.isnan(col_frp): #skip if the frp collected is nan 
-                        col_frp = 0
-                        if skip_nans == True:
-                            continue
-                    
-                    dist = (weather_current.lat - stat_current.lat.values)**2 + (weather_current.lon - stat_current.long.values)**2
-                    min_idx = dist.argmin(dim=["y", "x"]) # Find the (y, x) index of the minimum distance  
-                    #this gets the weather info for the cell closest to the station
-                    weather_near_station = weather_current.isel(y=min_idx["y"].values, x=min_idx["x"].values)
-                    
-                    cur_pm = stat_current['Sample Measurement'].values.flatten().item() #gets the pm2.5 values, both current and future
-                    frps = stat_current.collective_frps.values.flatten().item()
-                    fut_pm = stat_future['Sample Measurement'].values.flatten().item()
-                    u10 = weather_near_station.u10.values.flatten().item() #wind component
-                    v10 = weather_near_station.v10.values.flatten().item()
-                    t2m = weather_near_station.t2m.values.flatten().item() #2 meter temp
-                    sp = weather_near_station.sp.values.flatten().item() #surface pressure
-                    d2m = weather_near_station.d2m.values.flatten().item() #dew point temp
+    ############### prepare dates for gathering the data ###############
+    date_r_compare,dates_str_compare,date_r_train,dates_str_train = training_date_ranges(start_date=start_time,end_date=end_time,hour_offset=offset)
+    ############### get only stations with frp values to use for training ###############
+    station_only_frps = station_ds.dropna(subset=["collective_frp"])
+    lat = ds.lat.values
+    lon = ds.lon.values
+    points = np.column_stack([
+        lat.ravel(),
+        lon.ravel()
+    ])
 
-                    x = np.array([cur_pm,frps,u10,v10,t2m,sp,d2m])
-                    y = fut_pm
-                    Y_temp.append(y)
-                    
-                    X_temp.append(x)
-                    
-            else:
-                print('found a single station')
-                stat_current = stations_current
-                
-                site_id = stations_current.new_id.values
-                stat_future = stations_future.sel(indexers={'new_id':site_id})
-                col_frp = stat_current.collective_frps.values.flatten().item() #collective frp
-                if math.isnan(col_frp): #skip if the frp collected is nan 
-                    col_frp = 0
-                    if skip_nans == True:
-                        continue
-                
-                dist = (weather_current.lat - stat_current.lat.values)**2 + (weather_current.lon - stat_current.long.values)**2
-                min_idx = dist.argmin(dim=["y", "x"]) # Find the (y, x) index of the minimum distance  
-                    #this gets the weather info for the cell closest to the station
-                weather_near_station = weather_current.isel(y=min_idx["y"].values, x=min_idx["x"].values)
-                    
-                cur_pm = stat_current['Sample Measurement'].values.flatten().item() #gets the pm2.5 values, both current and future    
-                frps = stat_current.collective_frps.values.flatten().item()
-                fut_pm = stat_future['Sample Measurement'].values.flatten().item()
-                u10 = weather_near_station.u10.values.flatten().item() #wind component
-                v10 = weather_near_station.v10.values.flatten().item()
-                t2m = weather_near_station.t2m.values.flatten().item() #2 meter temp
-                sp = weather_near_station.sp.values.flatten().item() #surface pressure
-                d2m = weather_near_station.d2m.values.flatten().item() #dew point temp
-                
-                x = np.array([cur_pm,frps,u10,v10,t2m,sp,d2m])
-                y = fut_pm
-                
-                Y_temp.append(y)
-                
-                X_temp.append(x)
-                
-                
-                    
-    Y = np.array(Y_temp)
-    X = np.array(X_temp)
-    print(X)
-    print(Y)
-    print(X.shape)
-    print(Y.shape)
-    np.savetxt(X_train_path, X, delimiter=",")
-    np.savetxt(y_train_path, Y, delimiter=",")
-    print("Finished looping over the entries")
-    logging.info("Now that we have finished processing the data, we shall give you some basic statistics on the training set")
-    logging.info(f"Target pm2.5 mean:{Y.mean()}")
-    logging.info(f"Target pm2.5 max:{Y.max()}")
-    logging.info(f"Target pm2.5 min:{Y.min()}")
-    logging.info(f"Target pm2.5 std:{Y.std()}")
+    station_lat = station_only_frps["Latitude"].values
+    station_lon = station_only_frps["Longitude"].values % 360
+
+    station_points = np.column_stack([
+        station_lat,
+        station_lon
+    ])
+
+    tree = KDTree(points)
+    _, flat_idx = tree.query(station_points)
+    y_idx, x_idx = np.unravel_index(flat_idx, lat.shape) 
+    station_only_frps["y_idx"] = y_idx
+    station_only_frps["x_idx"] = x_idx  
     
 
+    ############### Main loop ###############
+    for r_compare,str_compare,r_train,str_train in zip(date_r_compare,dates_str_compare,date_r_train,dates_str_train): #for each timestamp
+        print(f"Processing time step: {r_train}")
+
+        stations_current = station_only_frps.loc[station_only_frps.index == r_train] #gets the station info for that hour
+        stations_future = station_only_frps.loc[station_only_frps.index == r_compare] #gets the station info for the future hour
+        weather_current = ds.sel(indexers={'time':str_train},method='nearest') #gets the current weather info
         
+        x_idxs = np.union1d(stations_current['x_idx'].values,stations_future['x_idx'].values)
+        y_idxs = np.union1d(stations_current['y_idx'],stations_future['y_idx'].values)
+        # De trending/normalization of the pm2.5
+        stations_current["Sample Measurement"] = stations_current["Sample Measurement"] - stations_current["last_years_avg"]
+        stations_future["Sample Measurement"] = stations_future["Sample Measurement"] - stations_future["last_years_avg"]
+
+        station_ids = xr.DataArray(
+            stations_current["aqis_id"].to_numpy(),
+            dims="station",
+            name="station"
+        )
+
+        station_ids_future = xr.DataArray(
+            stations_future["aqis_id"].to_numpy(),
+            dims="station",
+            name="station"
+        )
+
+        x_idxs = xr.DataArray(
+            stations_current["x_idx"].values,
+            dims="station",
+            coords={"station": station_ids}
+        )
+
+        y_idxs = xr.DataArray(
+            stations_current["y_idx"].values,
+            dims="station",
+            coords={"station": station_ids}
+        )
+
+        data = weather_current.isel(
+            y=y_idxs,
+            x=x_idxs,
+        )[weather_variables]
+
+        cur_pm25 = xr.DataArray(
+            stations_current["Sample Measurement"].to_numpy(),
+            dims="station",
+            coords={"station": station_ids}
+        )
+
+        fut_pm25 = xr.DataArray(
+            stations_future["Sample Measurement"].to_numpy(),
+            dims="station",
+            coords={"station":station_ids_future}
+        )
+
+        frp = xr.DataArray(
+            stations_current["collective_frp"].to_numpy(),
+            dims="station",
+            coords={"station": station_ids}
+        )
+
+        near_fires = xr.DataArray(
+            stations_current["num_fires_in_range"].to_numpy(),
+            dims="station",
+            coords={"station": station_ids}
+        )
+    
+        data["frp"] = frp
+        data["cur_pm25"] = cur_pm25
+        data["fut_pm25"] = fut_pm25
+        data["near_fires"] = near_fires
+        data["station_ids_current"] = station_ids
+        
+        
+        column_data = np.column_stack([
+            data[var].to_numpy().ravel() for var in data.data_vars
+        ])
+
+        
+        final_data.append(column_data)
+
+            #! add in the elevation
+            #! add the number of fires within the range as its own datapoint
+            #! era5 dataset total precipitation, to get that dataset, make a quiick loader for it to get it in
+            #! classification for high threshold instead of the other thing
+            #! also double check the collect_frp has the correct longitude thing
+
+    final_data = np.concatenate(final_data, axis=0)    
+    np.savetxt(X_train_path, final_data, delimiter=",", fmt="%s")
+    print("Finished looping over the entries")
+    # logging.info("Now that we have finished processing the data, we shall give you some basic statistics on the training set")
+    # logging.info(f"Target pm2.5 mean:{final_data[:,5].mean()}")
+    # logging.info(f"Target pm2.5 max:{final_data[:,5].max()}")
+    # logging.info(f"Target pm2.5 min:{final_data[:,5].min()}")
+    # logging.info(f"Target pm2.5 std:{final_data[:,5].std()}")
+    
+
+
 
 if __name__ == "__main__":
     main()

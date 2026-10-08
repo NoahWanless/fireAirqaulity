@@ -3,46 +3,26 @@ import zarr
 import sys
 sys.dont_write_bytecode = True
 import numpy as np
+import csv
 import argparse
 import logging
 import pandas as pd
 import xarray as xr
-from production_funcs import make_date_ranges,get_collective_frp,get_close_data,uniquify
-from pyproj import CRS, Transformer#these are the transformers for projections 
+from collections import deque
+from scipy.spatial import KDTree
+from production_funcs import make_date_ranges,get_collective_frp,uniquify,aggragate_frp_temporal
+from pyproj import CRS, Transformer # Transformers for projections 
 import os
 
-crs_aea_epsg = CRS.from_epsg(5070) #albers eaqual area projection
+crs_aea_epsg = CRS.from_epsg(5070) #Albers eaqual area projection
 transformer = Transformer.from_crs("EPSG:4326", crs_aea_epsg, always_xy=True) 
 
-new_path = uniquify('station_with_frp.csv')#makes sure the file name we save to in the end is unqiue
+new_path = uniquify('station_with_frp.csv')
 new_filename, extension = os.path.splitext(new_path)
 logging.basicConfig(filename=new_filename+".log", level=logging.INFO)
 
-# Example inputs for this program:
-# start_date: str = '2025-01-07 20:00',
-# end_date: str = '2025-01-07 20:00'
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--zarrPath", required=True)
-    parser.add_argument("--statPath", required=True)
-    parser.add_argument("--distance", required=True)
-    parser.add_argument("--safe", required=False)
-    parser.add_argument("--verbose", required=False)
-    parser.add_argument("--start", required=True)
-    parser.add_argument("--end", required=True)
-    args = parser.parse_args()
-    zarrPath = args.zarrPath
-    statPath = args.statPath 
-    radius_distance = int(args.distance)
-    start_time = args.start 
-    end_time = args.end
-    verbose = args.verbose
-    if args.safe=="False":
-        safe = False
-    else:
-         safe = True 
 
-    ################ Loading the zarr data ################
+def load_data(zarrPath,statPath):
     store = zarr.open_group(zarrPath, mode='r')
     available_fires = list(store.group_keys())
     if not available_fires:
@@ -53,90 +33,150 @@ def main():
         logging.info("Fires successfully found!")
         logging.info(f"Fires available on disk: {available_fires}")
         print(f"Fires available on disk: {available_fires}")
-        fire_id = available_fires[3] 
+        fire_id = available_fires[0] 
         # MUST use consolidated=False to read the appended stream correctly!
-        weather_fire_ds = xr.open_zarr(zarrPath, group=fire_id , consolidated=False) 
-        #fire_name = weather_fire_ds.attrs.get('Fire_Name', '')
-    weather_fire_ds.load() #turns the files from dask to array format
+        weather_fire_ds = xr.open_zarr(zarrPath, group=fire_id , consolidated=False) # Dont load the whole array onto disk, keep lazy loaded
     print("Zarr file loaded and ready")
     logging.info("Zarr file loaded and ready")
-
     ################ Loading the station data ################
-    df = pd.read_csv(statPath) 
-    station_ds = df.to_xarray()
-
-    ###### Prepare station data: ######
-    # Adding new coords for indexing purposes
+    station_ds = pd.read_csv(statPath) 
+    # Within a timestep, a station is uniqued identified by the state code, county code, site num, and POC num
     date_hour = station_ds['Date Local'] + ' ' + station_ds['Time Local']
-    station_ds = station_ds.assign_coords({'lat':station_ds['Latitude'],'long':station_ds['Longitude'],'date_hour':date_hour,})
+    aqis_id = station_ds['State Code'].astype('str') + ' ' + station_ds['County Code'].astype('str') + ' ' + station_ds['Site Num'].astype('str') + ' ' + station_ds['POC'].astype('str')
+    station_ds['aqis_id'] = aqis_id
+    station_ds['date_hour'] = date_hour 
+    station_ds = station_ds.set_index('date_hour')
     print("Station data loaded and prepared")
+    return station_ds, weather_fire_ds
+
+
+
+# Example inputs for this program:
+# start_date: str = '2025-01-07 20:00',
+# end_date: str = '2025-01-07 20:00'
+# python collect_frp.py --zarrPath "/home/exouser/labfetch/data/cali1mounthaug25.zarr" --statPath "/home/exouser/pmdata/hourly_88101_2025.csv" --distance 50000 --safe "False" --start "2025-08-07 20:00" --end "2025-08-29 20:00"
+
+#python collect_frp.py --zarrPath "/home/exouser/labfetch/data/cali1mounthaug25.zarr" --statPath "/home/exouser/pmdata/hourly_88101_2025.csv" --distance 50000  --start "2025-08-01 00:00" --end "2025-08-31 23:00" --reachBack 40
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--zarrPath", required=True)
+    parser.add_argument("--statPath", required=True)
+    parser.add_argument("--distance", required=True)
+    parser.add_argument("--reachBack", required=True )
+    parser.add_argument("--verbose", required=False)
+    parser.add_argument("--start", required=True)
+    parser.add_argument("--end", required=True)
+    args = parser.parse_args()
+    reach_back_length = int(args.reachBack)
+    zarrPath = args.zarrPath
+    statPath = args.statPath 
+    radius_distance = int(args.distance)
+    start_time = args.start 
+    end_time = args.end
+    verbose = args.verbose
+
+    ################ Loading the zarr data ################
+    station_ds, weather_fire_ds = load_data(zarrPath,statPath)
     ################ Prepare other variables ################
     date_r,dates_str = make_date_ranges(start_time,end_time)
-    safe=False
-    if safe == False:
-            warnings.warn("This is the unsafe option where we will try and correct the angle when calcuating it, this is not recommended and should only be used for testing")
-            logging.info("This is the unsafe option where we will try and correct the angle when calcuating it, this is not recommended and should only be used for testing")
     all_frps = []
     all_ind = []
     all_time = []
+    all_raw_frps = []
+    all_near_fires = []
+    single_frps = []
+    frp_cache = {}
     ################################ The main loop ################################
     for date_hour,date_hour_extended in zip(date_r,dates_str): #for each timestamp
         print(f"Processing time step: {date_hour}")
         logging.info(f"Beginning the processing of time step: {date_hour}")
-        stations_date_hour = station_ds.sel(indexers={'date_hour':date_hour}) #gets the station info for that hour
-        weather_frp_region = weather_fire_ds.sel(indexers={'time':date_hour_extended},method='nearest')
-        masked = weather_frp_region.where(weather_frp_region.rave_frp > 0, drop=True)#this nans out things that dont meet the conditions (ie only want valid fires)
-        if np.isnan(masked.rave_frp.values).all(): #if no valid fires
+        stations_date_hour = station_ds.loc[station_ds.index == date_hour] 
+        weather_frp_region = weather_fire_ds.sel(indexers={'time':date_hour_extended}, method='nearest')
+        fire_mask = weather_frp_region.where((weather_frp_region.rave_frp > 0).compute(), drop=True) # nans out values nans that dont have a rave_frp
+        skip_fires = False 
+        if np.isnan(fire_mask.rave_frp.values).all(): 
             print(f'No fires for this time step: {date_hour}, moving on')
             logging.info('No fires for this time step, moving on')
-            continue
-        mask_lon = masked.lon #gets the all the lat lon values for the weather fire data
-        mask_lat = masked.lat
-        mask_frp = masked.rave_frp
-        for i,thing in enumerate(stations_date_hour.index): #for each station by index(we can use the index to build other things)
-            ind = thing.index.values #gets this stations index 
-            logging.info(f"For time step {date_hour} considering station of index: {ind}")
-            sta = stations_date_hour.sel(indexers={'index':ind}) #get that specifc station by its index
-            #NOTE, what we pass in: 'weather_frp_region' is masked such that it should only have valid fires, however with how the 'drop=True' functionality works, what it
-            # drops is rows and columns of the dataset that are all naned out, HOWEVER, if a row or column still has regular values, but a nan or two in there, those nans will stay.
-            # The net result is that while a var in 'weather_frp_region' may have dimension 11 x 10, it doesnt have 110 non nan values. This explains why you need two checks later on.
-            # One is needed to ensure all values are within the distance, and whether they are valid fires.
-            fires_near, mask_x,mask_y,dist_mask,x_coord, y_coord,station_weather_near = get_close_data(sta,weather_frp_region,mask_lon,mask_lat,masked,dist_away=radius_distance)
-            if dist_mask.sum() == 0: #then there is no fires within the distance and move on
-                continue
-            frp = fires_near.rave_frp.values.flatten() #now we pull out all the relavent data we need and clean it
-            lat_rel = fires_near.lat.values.flatten()
-            lon_rel = fires_near.lon.values.flatten()
-            u10 = fires_near.u10.values.flatten()
-            v10 = fires_near.v10.values.flatten()
-            clean_frp = frp[~np.isnan(frp)] #this removes the nan values 
-            clean_u10 = u10[~np.isnan(u10)]
-            clean_v10 = v10[~np.isnan(v10)]
-            lat_clean = lat_rel[~np.isnan(frp)]
-            lon_clean = lon_rel[~np.isnan(frp)]
-            x_relavent, y_relavent = transformer.transform(lon_clean, lat_clean)
-            # Second sanity check: make sure that the fires_near outputed at least 1 valid fires
-            if x_relavent.shape[0] == 0: 
-                continue
-            logging.info(f"Time: {date_hour} Station: {ind} has {x_relavent.shape[0]} nearby fires")
-            frp = get_collective_frp(x_relavent,y_relavent,x_coord,y_coord,clean_u10,clean_v10,clean_frp,safe)
+            skip_fires = True
+        mask_x, mask_y = transformer.transform(fire_mask.lon.values.flatten() , fire_mask.lat.values.flatten() ) # Tansforms the fire locations
+        masked_frp = fire_mask.rave_frp.values.flatten() 
+        masked_u10 = fire_mask.u10.values.flatten()
+        masked_v10 = fire_mask.v10.values.flatten()
+
+        tree = KDTree(np.column_stack((mask_x, mask_y))) 
+
+        for _, sta in stations_date_hour.iterrows(): 
+            ind = sta["aqis_id"]
+            frp = 0 # A default of 0 frp per station per timestep is needed to insure the agragation through time is accurate
+            near_fires = 0
+            logging.info(f"For time step {date_hour} considering station: {ind}")
+            if ind not in frp_cache:
+                frp_cache[ind] = deque(maxlen=reach_back_length)
+
+            if skip_fires:
+                frp_cache[ind].append(0)
+
+            x_coord, y_coord = transformer.transform(sta['Longitude'], sta['Latitude']) # Transformers the Stations Lat Longs
+            indices = tree.query_ball_point(
+                [x_coord,y_coord],
+                radius_distance
+            )
+            # index = tree.query(
+            #     [x_coord,y_coord]
+            # )
+            raw_frp_sum = 0
+            #single_frp = 0
+            if indices: 
+                frp_near = masked_frp[indices]
+                #single_frp = masked_frp[index]
+                u10_near = masked_u10[indices]
+                v10_near = masked_v10[indices]
+                lon_near = mask_x[indices]
+                lat_near = mask_y[indices]
+    
+                valid = ~np.isnan(frp_near) & (frp_near > 0)
+    
+                frp_near = frp_near[valid]
+                u10_near = u10_near[valid]
+                v10_near = v10_near[valid]
+                lon_near = lon_near[valid]
+                lat_near = lat_near[valid]            
+                near_fires = lat_near.shape[0]
+                raw_frp_sum = frp_near.sum()
+                safe = False
+                if lat_near.size != 0:
+                    frp = get_collective_frp(lon_near,lat_near,x_coord,y_coord,u10_near,v10_near,frp_near,safe)
+                    
+            
+            logging.info(f"T: {date_hour} Stat: {ind}, {near_fires} nearby fires, frp: {frp}")
+            frp_cache[ind].append(frp)
+
+            frp = aggragate_frp_temporal(frp_cache[ind])
+            all_near_fires.append(near_fires)
+            all_raw_frps.append(raw_frp_sum) #sum of all frps in region NOT agragated
+            #single_frps.append(single_frp) #the frp for the cell the station is in
             all_frps.append(frp)
-            all_ind.append(ind.item())
+            all_ind.append(ind)
             all_time.append(date_hour)
+            
     print("Done collecting FRP's")
     logging.info("Done collecting FRP's")
+
     ############ Final appending of data ############
-    # we need to make the data into a dataset to merge them together
-    frp_temp = xr.Dataset(
-        data_vars={"collective_frps": (["index"], np.array(all_frps)),},
-        coords={
-            "index": ("index", all_ind),
-            "date_hour": ("index", all_time),
-        }
-    )
-    combined = xr.merge([station_ds, frp_temp])
+    results = pd.DataFrame({
+        "aqis_id": all_ind,
+        "date_hour": all_time,
+        "num_fires_in_range": all_near_fires,
+        "collective_frp": all_frps,
+        "sum_raw_frps": all_raw_frps
+    })
+    print("dataframe made")
+    results['aqis_id'] = results['aqis_id'].astype('str')
+    print("type changed")
+    df_combined = pd.merge(station_ds, results, on=['aqis_id', 'date_hour'], how='inner')
+    print("df's merged")
     ########### Saving the file ###########
-    df_combined = combined.to_dataframe()
+    
     df_combined.to_csv(new_path)
     print("File saved")
     logging.info("File saved")
@@ -151,3 +191,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
